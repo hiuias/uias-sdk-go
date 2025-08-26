@@ -2,6 +2,7 @@ package uias_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -12,7 +13,7 @@ import (
 func TestA(t *testing.T) {
 	client, err := uias.NewClientBuilder().
 		WithEndpoint("https://uias.apilocalvm.outsrkem.top:30078").
-		WithTimeout(10 * time.Second).WithUrlPath("/asd").
+		WithTimeout(10 * time.Second).
 		WithSkipTlsVerify(false).
 		Build()
 
@@ -27,13 +28,20 @@ func TestA(t *testing.T) {
 		ctx,
 		"request-12345",
 		"",
-		[]byte(`{"uias":{"action":"snms:report:print"}}`),
+		[]byte(`{"uias":{"action":"ledger:transaction:create"}}`),
 	)
-
-	fmt.Printf("----->%+v\n", resp)
 	if err != nil {
 		fmt.Printf("========>Verification failed: %v\n", err)
+	}
+
+	// 将结构体转换为JSON
+	jsonData, err := json.Marshal(resp)
+	if err != nil {
+		fmt.Println(err)
 		return
 	}
+
+	// 输出JSON字符串
+	fmt.Printf("----->%s\n", string(jsonData))
 
 }
