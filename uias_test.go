@@ -65,6 +65,5 @@ func TestB(t *testing.T) {
 		fmt.Println(err)
 	}
 
-	fmt.Println("token: ", res.Token)
+	fmt.Println("token: ", res.Data.Token)
 }
-
