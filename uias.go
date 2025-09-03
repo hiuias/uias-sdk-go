@@ -21,7 +21,7 @@ import (
 const (
 	defaultTimeout         = 10 * time.Second
 	defaultCheckActionPath = "/v1/uias/action/check"
-	defaultVerifyTokenPath = "/v1/uias/verify/token"
+	defaultVerifyTokenPath = "/v1/verify/token"
 	defaultTokenPath       = "/v1/uias/auth/token"
 	maxBodySize            = 10 << 20 // 10MB
 	maxBodyLogSize         = 500
