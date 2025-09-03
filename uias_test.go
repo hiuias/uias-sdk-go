@@ -10,26 +10,25 @@ import (
 	"github.com/hiuias/uias-sdk-go"
 )
 
+var (
+	endpoint  = ""
+	ak        = ""
+	sk        = ""
+	token     = ""
+	requestId = "request-12345"
+)
+
 func TestA(t *testing.T) {
-	client, err := uias.NewClientBuilder().
-		WithEndpoint("https://uias.apilocalvm.outsrkem.top:30078").
+	client := uias.NewClientBuilder().
+		WithEndpoint(endpoint).
 		WithTimeout(10 * time.Second).
 		WithSkipTlsVerify(false).
 		Build()
 
-	if err != nil {
-		fmt.Printf("Failed to create client: %v\n", err)
-		return
-	}
-
 	// 验证Token
 	ctx := context.Background()
-	resp, err := client.VerifyAction(
-		ctx,
-		"request-12345",
-		"",
-		[]byte(`{"uias":{"action":"ledger:transaction:create"}}`),
-	)
+	body := []byte(`{"uias":{"action":"ledger:transaction:create"}}`)
+	resp, err := client.VerifyAction(ctx, requestId, token, body)
 	if err != nil {
 		fmt.Printf("========>Verification failed: %v\n", err)
 	}
@@ -44,4 +43,27 @@ func TestA(t *testing.T) {
 	// 输出JSON字符串
 	fmt.Printf("----->%s\n", string(jsonData))
 
+}
+
+// 创建token
+func TestB(t *testing.T) {
+	auth := uias.NewCredentialBuilder().
+		WithAk(ak).
+		WithSk(sk).
+		Build()
+
+	client := uias.NewClientBuilder().
+		WithEndpoint(endpoint).
+		WithTimeout(10 * time.Second).
+		WithSkipTlsVerify(false).
+		WithCredential(auth).
+		Build()
+
+	ctx := context.Background()
+	res, err := client.CreateToken(ctx, requestId)
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	fmt.Println("token: ", res.Token)
 }

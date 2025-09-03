@@ -1,3 +1,4 @@
+// uias.go
 package uias
 
 import (
@@ -16,33 +17,66 @@ import (
 	"time"
 )
 
+// 常量定义
 const (
 	defaultTimeout         = 10 * time.Second
 	defaultCheckActionPath = "/v1/uias/action/check"
+	defaultVerifyTokenPath = "/v1/uias/verify/token"
+	defaultTokenPath       = "/v1/uias/auth/token"
+	maxBodySize            = 10 << 20 // 10MB
+	maxBodyLogSize         = 500
 	xRequestIdKey          = "X-Request-Id"
 	xAuthTokenKey          = "X-Auth-Token"
+	xSubjectTokenKey       = "X-Subject-Token"
 	contentTypeJSON        = "application/json; charset=utf-8"
 )
 
-// 定义错误类型
+// 成功状态码
+var successStatusCodes = map[int]bool{
+	http.StatusOK:      true, // 200
+	http.StatusCreated: true, // 201
+}
+
+// 错误类型定义
 var (
-	ErrInvalidEndpoint  = errors.New("endpoint is required and must be a valid URL")
-	ErrRequestFailed    = errors.New("request failed")
-	ErrInvalidResponse  = errors.New("invalid response from server")
-	ErrPermissionDenied = errors.New("permission denied")
-	ErrInvalidCACert    = errors.New("invalid CA certificate")
-	ErrRequestTimeout   = errors.New("request timeout")
+	ErrInvalidEndpoint    = errors.New("endpoint is required and must be a valid URL")
+	ErrRequestFailed      = errors.New("request failed")
+	ErrInvalidResponse    = errors.New("invalid response from server")
+	ErrPermissionDenied   = errors.New("permission denied")
+	ErrInvalidCACert      = errors.New("invalid CA certificate")
+	ErrRequestTimeout     = errors.New("request timeout")
+	ErrAuthNotConfigured  = errors.New("authentication not configured")
+	ErrResponseTooLarge   = errors.New("response body exceeds size limit")
+	ErrInvalidCredentials = errors.New("invalid credentials")
 )
 
-// RespData contains the returned data after successful token verification
-type RespData struct {
+// UIASError 自定义错误类型
+type UIASError struct {
+	Code     string
+	Message  string
+	Original error
+}
+
+func (e *UIASError) Error() string {
+	if e.Original != nil {
+		return fmt.Sprintf("UIAS error [%s]: %s (caused by: %v)", e.Code, e.Message, e.Original)
+	}
+	return fmt.Sprintf("UIAS error [%s]: %s", e.Code, e.Message)
+}
+
+func (e *UIASError) Unwrap() error {
+	return e.Original
+}
+
+// RespCheckActionData 包含令牌验证成功后返回的数据
+type RespCheckActionData struct {
 	Metadata struct {
 		Message string `json:"message"`
 		Time    int64  `json:"time"`
 		Ecode   string `json:"ecode"`
 	} `json:"metadata"`
 	Payload struct {
-		Authentication int    `json:"authentication"`
+		Authentication int    `json:"authentication"` // 1:有效;0:无效
 		Error          string `json:"error"`
 		Msg            struct {
 			Action    string `json:"action"`
@@ -64,36 +98,231 @@ type RespData struct {
 	} `json:"payload"`
 }
 
-// Config contains client configuration parameters
-type Config struct {
-	Endpoint        string        // Service endpoint (e.g., "https://api.example.com")
-	UrlPath         string        // API path to use for requests
-	SkipTlsVerify   bool          // Whether to skip TLS verification (default: false)
-	CACertPath      string        // Path to CA certificate file
-	Timeout         time.Duration // Request timeout duration (default: 5 seconds)
-	MaxIdleConns    int           // Maximum number of idle connections
-	IdleConnTimeout time.Duration // Timeout for idle connections
+// RespVerifyTokenData 包含令牌验证成功后返回的数据
+type RespVerifyTokenData struct {
+	Metadata struct {
+		Message string `json:"message"`
+		Time    int64  `json:"time"`
+		Ecode   string `json:"ecode"`
+	} `json:"metadata"`
+	Payload struct {
+		Token struct {
+			Valid     int    `json:"valid"` // 1:有效;0:无效
+			IssuedAt  string `json:"issued_at"`
+			ExpiresAt string `json:"expires_at"`
+		} `json:"token"`
+		User struct {
+			Domain struct {
+				Id   string `json:"id"`
+				Name string `json:"name"`
+			} `json:"domain"`
+			Id   string `json:"id"`
+			Name struct {
+				Account string `json:"account"`
+			} `json:"name"`
+		} `json:"user"`
+	} `json:"payload"`
 }
 
-// Client represents a UIAS service client
+// RespDataToken 包含令牌创建成功后返回的数据
+type RespDataToken struct {
+	Metadata struct {
+		Message string `json:"message"`
+		Time    int64  `json:"time"`
+		Ecode   string `json:"ecode"`
+	} `json:"metadata"`
+	Payload struct {
+		Token struct {
+			IssuedAt  string `json:"issued_at"`
+			ExpiresAt string `json:"expires_at"`
+			User      struct {
+				Domain struct {
+					ID   string `json:"id"`
+					Name string `json:"name"`
+				} `json:"domain"`
+				ID   string `json:"id"`
+				Name struct {
+					Account string `json:"account"`
+				} `json:"name"`
+			} `json:"user"`
+			Roles []struct {
+				ID   string `json:"id"`
+				Name string `json:"name"`
+			} `json:"roles"`
+		} `json:"token"`
+	} `json:"payload"`
+}
+
+// RespToken 令牌响应
+type RespToken struct {
+	Token string
+	Body  RespDataToken
+}
+
+// Config 包含客户端配置参数
+type Config struct {
+	Endpoint        string        // 服务端点 (例如: "https://api.example.com")
+	UrlPath         string        // 用于请求的API路径
+	SkipTlsVerify   bool          // 是否跳过TLS验证 (默认: false)
+	CACertPath      string        // CA证书文件路径
+	Timeout         time.Duration // 请求超时时间 (默认: 10秒)
+	MaxIdleConns    int           // 最大空闲连接数
+	IdleConnTimeout time.Duration // 空闲连接超时时间
+}
+
+// AuthConfig 认证配置
+type AuthConfig struct {
+	Ak string
+	Sk string
+}
+
+// Auth 认证信息
+type Auth struct {
+	config AuthConfig
+}
+
+// Response 封装HTTP请求的结果
+type Response struct {
+	StatusCode int         // 例如 200
+	Body       []byte      // 响应体内容
+	Header     http.Header // 响应头
+}
+
+// Logger 日志接口
+type Logger interface {
+	Debugf(format string, args ...interface{})
+	Infof(format string, args ...interface{})
+	Warnf(format string, args ...interface{})
+	Errorf(format string, args ...interface{})
+}
+
+// DefaultLogger 默认日志实现
+type DefaultLogger struct{}
+
+func (l *DefaultLogger) Debugf(format string, args ...interface{}) {
+	log.Printf("[DEBUG] "+format, args...)
+}
+
+func (l *DefaultLogger) Infof(format string, args ...interface{}) {
+	log.Printf("[INFO] "+format, args...)
+}
+
+func (l *DefaultLogger) Warnf(format string, args ...interface{}) {
+	log.Printf("[WARN] "+format, args...)
+}
+
+func (l *DefaultLogger) Errorf(format string, args ...interface{}) {
+	log.Printf("[ERROR] "+format, args...)
+}
+
+// Metrics 指标接口
+type Metrics interface {
+	IncRequestCounter(method, path string, statusCode int)
+	ObserveRequestDuration(method, path string, duration time.Duration)
+}
+
+// NoopMetrics 空指标实现
+type NoopMetrics struct{}
+
+func (m *NoopMetrics) IncRequestCounter(method, path string, statusCode int)              {}
+func (m *NoopMetrics) ObserveRequestDuration(method, path string, duration time.Duration) {}
+
+// UIASClient UIAS客户端接口
+type UIASClient interface {
+	VerifyAction(ctx context.Context, requestId, token string, rawBody []byte) (*RespCheckActionData, error)
+	CreateToken(ctx context.Context, requestId string) (*RespToken, error)
+	VerifyToken(ctx context.Context, requestId, token string) (*RespCheckActionData, error)
+	Close()
+}
+
+// Client 表示UIAS服务客户端
 type Client struct {
+	auth       *Auth
 	config     Config
 	httpClient *http.Client
+	logger     Logger
+	metrics    Metrics
 }
 
-// ClientBuilder helps construct a Client with specific configurations
+// ClientOption 客户端选项函数
+type ClientOption func(*Client)
+
+// CredentialBuilder 凭证构建器
+type CredentialBuilder struct {
+	config AuthConfig
+}
+
+// ClientBuilder 客户端构建器
 type ClientBuilder struct {
 	config Config
+	auth   *Auth
 }
 
-// Response encapsulates the results of an HTTP request
-type Response struct {
-	StatusCode int         // e.g. 200
-	Body       []byte      // Response body content
-	Header     http.Header // Response headers
+// 包装错误信息
+func wrapError(err error, message string) error {
+	if err == nil {
+		return errors.New(message)
+	}
+	return fmt.Errorf("%s: %w", message, err)
 }
 
-// NewClientBuilder creates a new client builder with default configuration
+// 过滤敏感字段
+func filterSensitiveFields(data map[string]interface{}) {
+	sensitiveFields := []string{"password", "secret", "token", "key", "sk", "ak"}
+	for _, field := range sensitiveFields {
+		if _, exists := data[field]; exists {
+			data[field] = "***REDACTED***"
+		}
+	}
+}
+
+// 清理日志中的敏感信息
+func sanitizeBodyForLog(body []byte) string {
+	if len(body) > maxBodyLogSize {
+		body = body[:maxBodyLogSize]
+	}
+
+	// 尝试解析JSON并过滤敏感字段
+	var jsonData map[string]interface{}
+	if err := json.Unmarshal(body, &jsonData); err == nil {
+		filterSensitiveFields(jsonData)
+		sanitized, _ := json.Marshal(jsonData)
+		return string(sanitized)
+	}
+
+	// 非JSON数据，直接返回截断内容
+	return string(body) + "..."
+}
+
+// NewCredentialBuilder 创建新的凭证构建器
+func NewCredentialBuilder() *CredentialBuilder {
+	return &CredentialBuilder{
+		config: AuthConfig{},
+	}
+}
+
+// WithAk 设置AK
+func (b *CredentialBuilder) WithAk(ak string) *CredentialBuilder {
+	b.config.Ak = ak
+	return b
+}
+
+// WithSk 设置SK
+func (b *CredentialBuilder) WithSk(sk string) *CredentialBuilder {
+	b.config.Sk = sk
+	return b
+}
+
+// Build 构建认证信息
+func (b *CredentialBuilder) Build() *Auth {
+	if b.config.Ak == "" || b.config.Sk == "" {
+		panic("ak or sk cannot be empty")
+	}
+
+	return &Auth{config: b.config}
+}
+
+// NewClientBuilder 创建新的客户端构建器
 func NewClientBuilder() *ClientBuilder {
 	return &ClientBuilder{
 		config: Config{
@@ -106,73 +335,143 @@ func NewClientBuilder() *ClientBuilder {
 	}
 }
 
-// WithEndpoint sets the service endpoint
+// WithEndpoint 设置服务端点
 func (b *ClientBuilder) WithEndpoint(endpoint string) *ClientBuilder {
 	b.config.Endpoint = endpoint
 	return b
 }
 
-// WithUrlPath sets the request path
+// WithUrlPath 设置请求路径
 func (b *ClientBuilder) WithUrlPath(path string) *ClientBuilder {
 	b.config.UrlPath = path
 	return b
 }
 
-// WithSkipTlsVerify sets whether to skip TLS verification
+// WithCredential 设置认证信息
+func (b *ClientBuilder) WithCredential(auth *Auth) *ClientBuilder {
+	if auth != nil {
+		b.auth = auth
+	}
+	return b
+}
+
+// WithSkipTlsVerify 设置是否跳过TLS验证
 func (b *ClientBuilder) WithSkipTlsVerify(skip bool) *ClientBuilder {
 	b.config.SkipTlsVerify = skip
 	return b
 }
 
-// WithCACertPath sets the CA certificate path
+// WithCACertPath 设置CA证书路径
 func (b *ClientBuilder) WithCACertPath(path string) *ClientBuilder {
 	b.config.CACertPath = path
 	return b
 }
 
-// WithTimeout sets the request timeout duration
+// WithTimeout 设置请求超时时间
 func (b *ClientBuilder) WithTimeout(timeout time.Duration) *ClientBuilder {
 	b.config.Timeout = timeout
 	return b
 }
 
-// WithConnectionPool sets connection pool parameters
+// WithConnectionPool 设置连接池参数
 func (b *ClientBuilder) WithConnectionPool(maxIdleConns int, idleTimeout time.Duration) *ClientBuilder {
 	b.config.MaxIdleConns = maxIdleConns
 	b.config.IdleConnTimeout = idleTimeout
 	return b
 }
 
-// Build constructs the client instance
-func (b *ClientBuilder) Build() (*Client, error) {
-	// Validate required configurations
-	if b.config.Endpoint == "" {
+// Build 构建客户端实例
+func (b *ClientBuilder) Build() *Client {
+	client, err := SafeBuild(b.config, b.auth)
+	if err != nil {
+		panic(err)
+	}
+	return client
+}
+
+// SafeBuild 创建新的客户端
+func SafeBuild(config Config, auth *Auth, opts ...ClientOption) (*Client, error) {
+	if config.Endpoint == "" {
 		return nil, ErrInvalidEndpoint
 	}
 
-	// Create HTTP client with proper configuration
-	httpClient, err := createHttpClient(
-		b.config.SkipTlsVerify,
-		b.config.CACertPath,
-		b.config.MaxIdleConns,
-		b.config.IdleConnTimeout,
-	)
+	httpClient, err := createHttpClient(config.SkipTlsVerify, config.CACertPath, config.MaxIdleConns, config.IdleConnTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create http client: %w", err)
+		return nil, wrapError(err, "failed to create http client")
 	}
 
-	// Set timeout
-	httpClient.Timeout = b.config.Timeout
+	httpClient.Timeout = config.Timeout
 
-	return &Client{
-		config:     b.config,
+	client := &Client{
+		auth:       auth,
+		config:     config,
 		httpClient: httpClient,
-	}, nil
+		logger:     &DefaultLogger{},
+		metrics:    &NoopMetrics{},
+	}
+
+	// 应用选项
+	for _, opt := range opts {
+		opt(client)
+	}
+
+	return client, nil
 }
 
-// createHttpClient initializes an HTTP client with connection pooling and TLS configuration
+// WithLogger 设置日志器
+func WithLogger(logger Logger) ClientOption {
+	return func(c *Client) {
+		c.logger = logger
+	}
+}
+
+// WithMetrics 设置指标收集器
+func WithMetrics(metrics Metrics) ClientOption {
+	return func(c *Client) {
+		c.metrics = metrics
+	}
+}
+
+// 创建TLS配置
+func createTLSConfig(skipTlsVerify bool, caCertPath string) (*tls.Config, error) {
+	if skipTlsVerify {
+		return &tls.Config{InsecureSkipVerify: true}, nil
+	}
+
+	config := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		CurvePreferences: []tls.CurveID{
+			tls.CurveP256,
+			tls.X25519,
+		},
+	}
+
+	if caCertPath != "" {
+		// 加载CA证书
+		caCert, err := os.ReadFile(caCertPath)
+		if err != nil {
+			return nil, wrapError(err, "failed to read CA certificate")
+		}
+
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM(caCert) {
+			return nil, ErrInvalidCACert
+		}
+		config.RootCAs = caCertPool
+	}
+
+	return config, nil
+}
+
+// 创建HTTP客户端
 func createHttpClient(skipTlsVerify bool, caCertPath string, maxIdleConns int, idleConnTimeout time.Duration) (*http.Client, error) {
-	// Create transport with connection pooling
+	// 创建TLS配置
+	tlsConfig, err := createTLSConfig(skipTlsVerify, caCertPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// 创建传输层配置
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
@@ -184,50 +483,13 @@ func createHttpClient(skipTlsVerify bool, caCertPath string, maxIdleConns int, i
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     true,
-	}
-
-	// Configure TLS
-	var tlsConfig *tls.Config
-	switch {
-	case caCertPath != "":
-		// Load custom CA certificate
-		caCert, err := os.ReadFile(caCertPath)
-		if err != nil {
-			return nil, fmt.Errorf("%w: failed to read CA certificate: %v", ErrInvalidCACert, err)
-		}
-
-		// Create certificate pool
-		caCertPool, _ := x509.SystemCertPool()
-		if caCertPool == nil {
-			caCertPool = x509.NewCertPool()
-		}
-
-		// Add custom CA certificate to the pool
-		if !caCertPool.AppendCertsFromPEM(caCert) {
-			return nil, fmt.Errorf("%w: failed to parse CA certificate", ErrInvalidCACert)
-		}
-
-		tlsConfig = &tls.Config{
-			RootCAs: caCertPool,
-		}
-
-		if skipTlsVerify {
-			log.Printf("warning: skipTlsVerify=true is ignored when using custom CA: %s", caCertPath)
-		}
-
-	case skipTlsVerify:
-		// Skip TLS verification (INSECURE - for testing only)
-		tlsConfig = &tls.Config{InsecureSkipVerify: true}
-	}
-
-	if tlsConfig != nil {
-		transport.TLSClientConfig = tlsConfig
+		TLSClientConfig:       tlsConfig,
 	}
 
 	return &http.Client{Transport: transport}, nil
 }
 
-// sendHttpRequest sends an HTTP request and handles the response safely
+// 发送HTTP请求
 func sendHttpRequest(
 	ctx context.Context,
 	client *http.Client,
@@ -235,7 +497,7 @@ func sendHttpRequest(
 	body []byte,
 	headers map[string]string,
 ) (*Response, error) {
-	// Create request with context
+	// 创建请求
 	var bodyReader io.Reader
 	if body != nil {
 		bodyReader = bytes.NewReader(body)
@@ -243,36 +505,52 @@ func sendHttpRequest(
 
 	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, wrapError(err, "failed to create request")
 	}
 
-	// Apply headers
+	// 设置请求头
 	for key, value := range headers {
 		req.Header.Set(key, value)
 	}
 
-	// Execute request
+	// 执行请求
+	start := time.Now()
 	resp, err := client.Do(req)
+	duration := time.Since(start)
+
+	// 记录指标
+	if metrics, ok := client.Transport.(interface {
+		ObserveRequestDuration(method, url string, duration time.Duration)
+	}); ok {
+		metrics.ObserveRequestDuration(method, url, duration)
+	}
+
 	if err != nil {
-		// Check if it's a timeout error
+		// 检查是否为超时错误
 		if os.IsTimeout(err) {
 			return nil, ErrRequestTimeout
 		}
-		return nil, fmt.Errorf("%w: %v", ErrRequestFailed, err)
+		return nil, wrapError(ErrRequestFailed, err.Error())
 	}
 	defer resp.Body.Close()
 
-	// Read response body with limit to prevent excessive memory usage
-	maxBodySize := int64(10 * 1024 * 1024) // 10MB limit
+	// 记录请求状态指标
+	if metrics, ok := client.Transport.(interface {
+		IncRequestCounter(method, url string, statusCode int)
+	}); ok {
+		metrics.IncRequestCounter(method, url, resp.StatusCode)
+	}
+
+	// 读取响应体
 	limitedReader := &io.LimitedReader{R: resp.Body, N: maxBodySize}
 	responseBody, err := io.ReadAll(limitedReader)
 	if err != nil {
-		return nil, fmt.Errorf("%w: failed to read response body: %v", ErrInvalidResponse, err)
+		return nil, wrapError(ErrInvalidResponse, "failed to read response body")
 	}
 
-	// Check if we hit the size limit
+	// 检查是否超过大小限制
 	if limitedReader.N <= 0 {
-		return nil, fmt.Errorf("%w: response body exceeds size limit", ErrInvalidResponse)
+		return nil, ErrResponseTooLarge
 	}
 
 	return &Response{
@@ -282,60 +560,180 @@ func sendHttpRequest(
 	}, nil
 }
 
-// VerifyAction verifies the action permission with enhanced error handling
-func (c *Client) VerifyAction(ctx context.Context, requestId, token string, rawBody []byte) (*RespData, error) {
-	// Build request headers
+// 执行请求
+func (c *Client) doRequest(ctx context.Context, method, path string, body []byte, headers map[string]string) (*Response, error) {
+	url := c.config.Endpoint + path
+	c.logger.Debugf("Making request: %s %s", method, url)
+
+	response, err := sendHttpRequest(ctx, c.httpClient, method, url, body, headers)
+	if err != nil {
+		c.logger.Errorf("Request failed: %s %s: %v", method, url, err)
+		return nil, err
+	}
+
+	c.logger.Debugf("Response status: %d %s", response.StatusCode, http.StatusText(response.StatusCode))
+	return response, nil
+}
+
+// 检查状态码是否为成功状态码
+func isSuccessStatusCode(statusCode int) bool {
+	return successStatusCodes[statusCode]
+}
+
+// 处理错误响应
+func (c *Client) handleErrorResponse(response *Response) error {
+	// 尝试解析错误响应为JSON
+	var errorResp struct {
+		Metadata struct {
+			Message string `json:"message"`
+			Ecode   string `json:"ecode"`
+		} `json:"metadata"`
+	}
+
+	if jsonErr := json.Unmarshal(response.Body, &errorResp); jsonErr == nil {
+		return &UIASError{
+			Code:     errorResp.Metadata.Ecode,
+			Message:  errorResp.Metadata.Message,
+			Original: fmt.Errorf("UIAS returned error status: %d", response.StatusCode),
+		}
+	}
+
+	// 如果不是JSON，返回原始响应体进行调试
+	bodyStr := sanitizeBodyForLog(response.Body)
+	return &UIASError{
+		Code:     "UNKNOWN",
+		Message:  fmt.Sprintf("UIAS returned error status: %d, response: %s", response.StatusCode, bodyStr),
+		Original: ErrRequestFailed,
+	}
+}
+
+// 解析响应
+func (c *Client) parseResponse(response *Response, result interface{}) error {
+	if !isSuccessStatusCode(response.StatusCode) {
+		return c.handleErrorResponse(response)
+	}
+
+	if err := json.Unmarshal(response.Body, result); err != nil {
+		c.logger.Errorf("Invalid JSON response: %s", sanitizeBodyForLog(response.Body))
+		return wrapError(ErrInvalidResponse, "failed to parse response")
+	}
+
+	return nil
+}
+
+// VerifyAction 验证操作权限
+func (c *Client) VerifyAction(ctx context.Context, requestId, token string, rawBody []byte) (*RespCheckActionData, error) {
+	// 构建请求头
 	headers := map[string]string{
 		"Content-Type": contentTypeJSON,
 		xRequestIdKey:  requestId,
 		xAuthTokenKey:  token,
 	}
 
-	// Build request URL
-	url := c.config.Endpoint + c.config.UrlPath
-
-	// Send request with context
-	response, err := sendHttpRequest(ctx, c.httpClient, "POST", url, rawBody, headers)
+	// 发送请求
+	response, err := c.doRequest(ctx, "POST", c.config.UrlPath, rawBody, headers)
 	if err != nil {
-		return nil, fmt.Errorf("request to UIAS failed: %w", err)
+		return nil, err
 	}
 
-	// Check response status code first
-	if response.StatusCode != http.StatusOK {
-		// Try to parse error response as JSON
-		var errorResp RespData
-		if jsonErr := json.Unmarshal(response.Body, &errorResp); jsonErr == nil {
-			return &errorResp, fmt.Errorf("UIAS returned error status: %d, message: %s",
-				response.StatusCode, errorResp.Metadata.Message)
-		}
-
-		// If not JSON, return the raw response body for debugging
-		bodyStr := string(response.Body)
-		if len(bodyStr) > 200 {
-			bodyStr = bodyStr[:200] + "..."
-		}
-		return nil, fmt.Errorf("UIAS returned error status: %d, response: %s",
-			response.StatusCode, bodyStr)
-	}
-
-	// Parse response body
-	var respData RespData
-	if err := json.Unmarshal(response.Body, &respData); err != nil {
-		// Log the invalid response for debugging
-		bodyStr := string(response.Body)
-		if len(bodyStr) > 200 {
-			bodyStr = bodyStr[:200] + "..."
-		}
-		log.Printf("Invalid JSON response from UIAS: %s", bodyStr)
-		return nil, fmt.Errorf("%w: failed to parse response: %v", ErrInvalidResponse, err)
+	// 解析响应
+	var respData RespCheckActionData
+	if err := c.parseResponse(response, &respData); err != nil {
+		return nil, err
 	}
 
 	return &respData, nil
 }
 
-// Close releases any resources held by the client
+// 构建令牌请求
+func (c *Client) buildTokenRequest() ([]byte, error) {
+	type rawReq struct {
+		Auth struct {
+			Credential struct {
+				ID     string `json:"id"`
+				Secret string `json:"secret"`
+			} `json:"credential"`
+		} `json:"auth"`
+	}
+
+	var raw rawReq
+	raw.Auth.Credential.ID = c.auth.config.Ak
+	raw.Auth.Credential.Secret = c.auth.config.Sk
+
+	rawBody, err := json.Marshal(raw)
+	if err != nil {
+		return nil, wrapError(err, "failed to marshal token request")
+	}
+
+	return rawBody, nil
+}
+
+// CreateToken 创建令牌
+func (c *Client) CreateToken(ctx context.Context, requestId string) (*RespToken, error) {
+	if c.auth == nil {
+		return nil, ErrAuthNotConfigured
+	}
+
+	// 构建请求头
+	headers := map[string]string{
+		"Content-Type": contentTypeJSON,
+		xRequestIdKey:  requestId,
+	}
+
+	// 构建请求体
+	requestBody, err := c.buildTokenRequest()
+	if err != nil {
+		return nil, err
+	}
+
+	// 发送请求
+	response, err := c.doRequest(ctx, "POST", defaultTokenPath, requestBody, headers)
+	if err != nil {
+		return nil, err
+	}
+
+	// 解析响应 - 注意：CreateToken 期望 201 状态码
+	if !isSuccessStatusCode(response.StatusCode) {
+		return nil, c.handleErrorResponse(response)
+	}
+
+	var respData RespDataToken
+	if err := json.Unmarshal(response.Body, &respData); err != nil {
+		c.logger.Errorf("Invalid JSON response: %s", sanitizeBodyForLog(response.Body))
+		return nil, wrapError(ErrInvalidResponse, "failed to parse response")
+	}
+
+	token := response.Header.Get(xSubjectTokenKey)
+	return &RespToken{Token: token, Body: respData}, nil
+}
+
+// VerifyToken 验证令牌
+func (c *Client) VerifyToken(ctx context.Context, requestId, token string) (*RespVerifyTokenData, error) {
+	// 构建请求头
+	headers := map[string]string{
+		"Content-Type": contentTypeJSON,
+		xRequestIdKey:  requestId,
+		xAuthTokenKey:  token,
+	}
+
+	// 发送请求
+	response, err := c.doRequest(ctx, "POST", defaultVerifyTokenPath, nil, headers)
+	if err != nil {
+		return nil, err
+	}
+
+	// 解析响应
+	var respData RespVerifyTokenData
+	if err := c.parseResponse(response, &respData); err != nil {
+		return nil, err
+	}
+
+	return &respData, nil
+}
+
+// Close 释放客户端持有的资源
 func (c *Client) Close() {
-	// Close idle connections if transport supports it
+	// 关闭空闲连接
 	if transport, ok := c.httpClient.Transport.(*http.Transport); ok {
 		transport.CloseIdleConnections()
 	}
